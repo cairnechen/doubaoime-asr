@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 import json
 from pathlib import Path
@@ -37,6 +37,59 @@ class ResponseType(Enum):
 
 
 @dataclass
+class ASRWord:
+    """单词级别的识别结果"""
+    word: str
+    start_time: float
+    end_time: float
+
+
+@dataclass
+class OIDecodingInfo:
+    """OI 解码信息"""
+    oi_former_word_num: int = 0
+    oi_latter_word_num: int = 0
+    oi_words: Optional[List] = None
+
+
+@dataclass
+class ASRAlternative:
+    """识别候选结果"""
+    text: str
+    start_time: float
+    end_time: float
+    words: List[ASRWord] = field(default_factory=list)
+    semantic_related_to_prev: Optional[bool] = None
+    oi_decoding_info: Optional[OIDecodingInfo] = None
+
+
+@dataclass
+class ASRResult:
+    """单条识别结果"""
+    text: str
+    start_time: float
+    end_time: float
+    confidence: float = 0.0
+    alternatives: List[ASRAlternative] = field(default_factory=list)
+    is_interim: bool = True
+    is_vad_finished: bool = False
+    index: int = 0
+
+
+@dataclass
+class ASRExtra:
+    """响应附加信息"""
+    audio_duration: Optional[int] = None
+    model_avg_rtf: Optional[float] = None
+    model_send_first_response: Optional[int] = None
+    speech_adaptation_version: Optional[str] = None
+    model_total_process_time: Optional[int] = None
+    packet_number: Optional[int] = None
+    vad_start: Optional[bool] = None
+    req_payload: Optional[dict] = None
+
+
+@dataclass
 class ASRResponse:
     """
     ASR 响应
@@ -49,6 +102,8 @@ class ASRResponse:
     packet_number: int = -1
     error_msg: str = ""
     raw_json: Optional[dict] = None
+    results: List[ASRResult] = field(default_factory=list)
+    extra: Optional[ASRExtra] = None
 
 
 class ASRError(Exception):
@@ -469,6 +524,68 @@ def _build_asr_request(
 
 
 
+def _parse_word(data: dict) -> ASRWord:
+    """解析单词数据"""
+    return ASRWord(
+        word=data.get("word", ""),
+        start_time=data.get("start_time", 0.0),
+        end_time=data.get("end_time", 0.0),
+    )
+
+
+def _parse_oi_decoding_info(data: Optional[dict]) -> Optional[OIDecodingInfo]:
+    """解析 OI 解码信息"""
+    if data is None:
+        return None
+    return OIDecodingInfo(
+        oi_former_word_num=data.get("oi_former_word_num", 0),
+        oi_latter_word_num=data.get("oi_latter_word_num", 0),
+        oi_words=data.get("oi_words"),
+    )
+
+
+def _parse_alternative(data: dict) -> ASRAlternative:
+    """解析候选结果"""
+    words = [_parse_word(w) for w in data.get("words", [])]
+    return ASRAlternative(
+        text=data.get("text", ""),
+        start_time=data.get("start_time", 0.0),
+        end_time=data.get("end_time", 0.0),
+        words=words,
+        semantic_related_to_prev=data.get("semantic_related_to_prev"),
+        oi_decoding_info=_parse_oi_decoding_info(data.get("oi_decoding_info")),
+    )
+
+
+def _parse_result(data: dict) -> ASRResult:
+    """解析单条识别结果"""
+    alternatives = [_parse_alternative(a) for a in data.get("alternatives", [])]
+    return ASRResult(
+        text=data.get("text", ""),
+        start_time=data.get("start_time", 0.0),
+        end_time=data.get("end_time", 0.0),
+        confidence=data.get("confidence", 0.0),
+        alternatives=alternatives,
+        is_interim=data.get("is_interim", True),
+        is_vad_finished=data.get("is_vad_finished", False),
+        index=data.get("index", 0),
+    )
+
+
+def _parse_extra(data: dict) -> ASRExtra:
+    """解析附加信息"""
+    return ASRExtra(
+        audio_duration=data.get("audio_duration"),
+        model_avg_rtf=data.get("model_avg_rtf"),
+        model_send_first_response=data.get("model_send_first_response"),
+        speech_adaptation_version=data.get("speech_adaptation_version"),
+        model_total_process_time=data.get("model_total_process_time"),
+        packet_number=data.get("packet_number"),
+        vad_start=data.get("vad_start"),
+        req_payload=data.get("req_payload"),
+    )
+
+
 def _parse_response(data: bytes) -> ASRResponse:
     """解析 ASR 响应 (使用 protobuf)"""
     pb = AsrResponsePb()
@@ -500,20 +617,33 @@ def _parse_response(data: bytes) -> ASRResponse:
     except json.JSONDecodeError:
         return ASRResponse(type=ResponseType.UNKNOWN)
 
-    results = json_data.get("results")
-    extra = json_data.get("extra", {})
+    results_raw = json_data.get("results")
+    extra_raw = json_data.get("extra", {})
+
+    # 解析为强类型
+    parsed_extra = _parse_extra(extra_raw)
 
     # 无 results，可能是心跳包
-    if results is None:
+    if results_raw is None:
         return ASRResponse(
             type=ResponseType.HEARTBEAT,
-            packet_number=extra.get("packet_number", -1),
+            packet_number=extra_raw.get("packet_number", -1),
             raw_json=json_data,
+            extra=parsed_extra,
         )
 
+    # 解析 results
+    parsed_results = [_parse_result(r) for r in results_raw]
+
     # VAD 开始
-    if extra.get("vad_start"):
-        return ASRResponse(type=ResponseType.VAD_START, vad_start=True, raw_json=json_data)
+    if extra_raw.get("vad_start"):
+        return ASRResponse(
+            type=ResponseType.VAD_START,
+            vad_start=True,
+            raw_json=json_data,
+            results=parsed_results,
+            extra=parsed_extra,
+        )
 
     # 解析识别结果
     text = ""
@@ -521,7 +651,7 @@ def _parse_response(data: bytes) -> ASRResponse:
     vad_finished = False
     nonstream_result = False
 
-    for r in results:
+    for r in results_raw:
         if r.get("text"):
             text = r.get("text")
         if r.get("is_interim") is False:
@@ -539,6 +669,8 @@ def _parse_response(data: bytes) -> ASRResponse:
             is_final=True,
             vad_finished=vad_finished,
             raw_json=json_data,
+            results=parsed_results,
+            extra=parsed_extra,
         )
 
     # 中间结果
@@ -547,6 +679,8 @@ def _parse_response(data: bytes) -> ASRResponse:
         text=text,
         is_final=False,
         raw_json=json_data,
+        results=parsed_results,
+        extra=parsed_extra,
     )
 
 

@@ -111,7 +111,9 @@ async def transcribe(
 - `audio`: 音频文件路径或 PCM 字节数据
 - `config`: ASR 配置
 - `on_interim`: 中间结果回调
-- `realtime`: 是否模拟实时发送（按音频时长插入延迟）
+- `realtime`: 是否模拟实时发送（每个音频数据帧之间加入固定的发送延迟）
+    - `True`: 模拟实时发送，加入固定的延迟，表现得更像正常的客户端，但会增加整体识别时间
+    - `False`: 尽可能快地发送所有数据帧，整体识别时间更短（貌似也不会被风控）
 
 ### transcribe_stream
 
